@@ -18,3 +18,5 @@ If you are developing a production application, we recommend using TypeScript wi
 
 
 update server/index.js, app.jsx, authview.jsx, codeview.jsx, new file src/config.js
+
+npm run dev -- --host 0.0.0.0
