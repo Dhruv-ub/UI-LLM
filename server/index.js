@@ -10,10 +10,24 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const allowedOrigins = process.env.FRONTEND_URL.split(',');
-// Enable CORS with Credentials support for secure HTTP-Only Refresh Tokens
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',').map(s => s.trim());
+
+// Dynamic CORS: accept listed origins + any private/LAN IP on the frontend dev port
 app.use(cors({
-    origin: allowedOrigins, // Now this is an array like ['url1', 'url2']
+    origin: function (origin, callback) {
+      // Allow requests with no origin (mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      // Always allow explicitly listed origins from .env
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      // Allow any private network IP (LAN) accessing on the Vite dev port
+      // Matches: 192.168.x.x, 10.x.x.x, 172.16-31.x.x, and localhost variants
+      const lanPattern = /^http:\/\/(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|localhost|127\.0\.0\.1)(:\d+)?$/;
+      if (lanPattern.test(origin)) return callback(null, true);
+
+      callback(new Error('Not allowed by CORS'));
+    },
     credentials: true
 }));
 

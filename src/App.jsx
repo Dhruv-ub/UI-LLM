@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import CodeView from './components/CodeView';
 import AuthView from './components/AuthView';
+import { API_BASE } from './config';
 
 export default function App() {
   const [view, setView] = useState('chat'); // 'chat' or 'auth'
@@ -19,7 +20,7 @@ export default function App() {
   useEffect(() => {
     const checkAuth = async () => {
       try {
-        const res = await fetch('http://localhost:5000/auth/refresh', {
+        const res = await fetch(`${API_BASE}/auth/refresh`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include' // Crucial to send HttpOnly cookies
@@ -31,7 +32,7 @@ export default function App() {
             setAccessToken(data.accessToken);
             
             // Get user profile details
-            const userRes = await fetch('http://localhost:5000/auth/me', {
+            const userRes = await fetch(`${API_BASE}/auth/me`, {
               headers: { 'Authorization': `Bearer ${data.accessToken}` }
             });
             
@@ -69,7 +70,7 @@ export default function App() {
   // Silent token refresh — called by CodeView when a request gets 401/403
   const refreshAccessToken = async () => {
     try {
-      const res = await fetch('http://localhost:5000/auth/refresh', {
+      const res = await fetch(`${API_BASE}/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include'
@@ -89,7 +90,7 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch('http://localhost:5000/auth/logout', {
+      await fetch(`${API_BASE}/auth/logout`, {
         method: 'POST',
         credentials: 'include'
       });

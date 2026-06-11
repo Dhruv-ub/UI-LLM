@@ -16,34 +16,46 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
 });
 
-// FILE UPLOAD: POST /upload — Extract text from PDF, CSV, or text files
+// Shared file parsing helper
+const parseUploadedFile = async (file) => {
+  const { originalname, mimetype, buffer } = file;
+  const ext = originalname.split('.').pop().toLowerCase();
+  let extractedText = '';
+
+  if (ext === 'pdf' || mimetype === 'application/pdf') {
+    const pdfData = await pdfParse(buffer);
+    extractedText = pdfData.text;
+  } else {
+    extractedText = buffer.toString('utf-8');
+  }
+
+  return { filename: originalname, content: extractedText, size: buffer.length };
+};
+
+// FILE UPLOAD: POST /upload — Extract text from PDF, CSV, or text files (authenticated)
 router.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ status: 'error', message: 'No file provided' });
     }
-
-    const { originalname, mimetype, buffer } = req.file;
-    const ext = originalname.split('.').pop().toLowerCase();
-    let extractedText = '';
-
-    if (ext === 'pdf' || mimetype === 'application/pdf') {
-      // Use pdf-parse to extract text from PDF binary buffer
-      const pdfData = await pdfParse(buffer);
-      extractedText = pdfData.text;
-    } else {
-      // All other files: treat as UTF-8 text (CSV, TXT, code, etc.)
-      extractedText = buffer.toString('utf-8');
-    }
-
-    return res.status(200).json({
-      status: 'success',
-      filename: originalname,
-      content: extractedText,
-      size: buffer.length
-    });
+    const result = await parseUploadedFile(req.file);
+    return res.status(200).json({ status: 'success', ...result });
   } catch (err) {
     console.error('File Upload Processing Error:', err);
+    return res.status(500).json({ status: 'error', message: 'Failed to process uploaded file' });
+  }
+});
+
+// GUEST FILE UPLOAD: POST /guest/upload — Same parsing but no auth required
+router.post('/guest/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ status: 'error', message: 'No file provided' });
+    }
+    const result = await parseUploadedFile(req.file);
+    return res.status(200).json({ status: 'success', ...result });
+  } catch (err) {
+    console.error('Guest File Upload Processing Error:', err);
     return res.status(500).json({ status: 'error', message: 'Failed to process uploaded file' });
   }
 });
@@ -322,6 +334,99 @@ router.post('/messages', authenticateToken, async (req, res) => {
     console.error('Streaming Lifecycle Failure:', err);
     if (!res.headersSent) {
       return res.status(500).json({ status: 'error', message: 'Internal server boundary error handling message stream' });
+    }
+    res.end();
+  }
+});
+
+// ============================================================
+// GUEST (ANONYMOUS) CHAT — No auth, no DB persistence
+// Session-only: frontend keeps messages in memory
+// ============================================================
+
+router.post('/guest/messages', async (req, res) => {
+  const { messages: chatHistory, content } = req.body;
+
+  if (!content) {
+    return res.status(400).json({ status: 'error', message: 'Message content is required' });
+  }
+
+  try {
+    // Build message array from frontend-supplied session history
+    const formattedHistory = Array.isArray(chatHistory) ? [...chatHistory] : [];
+    formattedHistory.push({ role: 'user', content });
+
+    // Configure SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    let completeAiResponse = '';
+
+    try {
+      const llamaResponse = await fetch('http://localhost:8080/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: formattedHistory,
+          stream: true
+        })
+      });
+
+      if (!llamaResponse.ok) {
+        throw new Error(`llama-server returned status: ${llamaResponse.status}`);
+      }
+
+      const reader = llamaResponse.body;
+      reader.setEncoding('utf8');
+
+      let buffer = '';
+
+      await new Promise((resolve, reject) => {
+        reader.on('data', (chunk) => {
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const cleanedLine = line.trim();
+            if (!cleanedLine || cleanedLine === 'data: [DONE]') continue;
+
+            if (cleanedLine.startsWith('data: ')) {
+              try {
+                const parsedJson = JSON.parse(cleanedLine.replace('data: ', ''));
+                const tokenContent = parsedJson.choices[0]?.delta?.content || '';
+
+                if (tokenContent) {
+                  completeAiResponse += tokenContent;
+                  res.write(`data: ${JSON.stringify({ chunk: tokenContent })}\n\n`);
+                }
+              } catch (jsonErr) {
+                // Skip incomplete JSON chunks
+              }
+            }
+          }
+        });
+
+        reader.on('end', () => resolve());
+        reader.on('error', (err) => reject(err));
+      });
+
+    } catch (llamaErr) {
+      console.error('Guest chat — llama-server error:', llamaErr);
+      const errorMsg = '\n\n**Backend Connection Error:** Failed to communicate with llama-server. Ensure it is running on port 8080.';
+      res.write(`data: ${JSON.stringify({ chunk: errorMsg })}\n\n`);
+    }
+
+    // No DB writes — stream is purely ephemeral
+    res.write('data: [DONE]\n\n');
+    res.end();
+
+  } catch (err) {
+    console.error('Guest Streaming Lifecycle Failure:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({ status: 'error', message: 'Internal error handling guest message stream' });
     }
     res.end();
   }
