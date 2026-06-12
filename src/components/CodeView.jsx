@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useEffectEvent, useLayoutEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -27,7 +27,15 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  const [isUploadMenuOpen, setIsUploadMenuOpen] = useState(false);
  const [isParsingFile, setIsParsingFile] = useState(false);
 
+  // Stop / Edit state
+  const [wasStopped, setWasStopped] = useState(false);
+  const abortControllerRef = useRef(null);
+  const lastUserPromptRef = useRef('');
+
  const messagesEndRef = useRef(null);
+ const chatContainerRef = useRef(null);
+ const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
+ const isAutoScrollingRef = useRef(false);
  const textareaRef = useRef(null);
  const fileInputRef = useRef(null);
  const uploadMenuRef = useRef(null);
@@ -142,13 +150,43 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  }
  }, [activeConvId, user, isGuest, fetchMessages, isGenerating]);
 
- const scrollToLatestMessage = useEffectEvent((behavior = 'smooth') => {
- messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' });
- });
+  const scrollToBottom = useCallback((behavior = 'smooth') => {
+    const container = chatContainerRef.current;
+    if (!container) return;
+    isAutoScrollingRef.current = true;
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior
+    });
+    // Reset the auto-scrolling flag after the scroll animation completes
+    setTimeout(() => { isAutoScrollingRef.current = false; }, behavior === 'smooth' ? 400 : 50);
+  }, []);
 
- useEffect(() => {
- scrollToLatestMessage(messages.length > 2 ? 'smooth' : 'auto');
- }, [messages, scrollToLatestMessage]);
+  // Smart auto-scroll: only scroll down if user hasn't scrolled up
+  useEffect(() => {
+    if (!isUserScrolledUp) {
+      scrollToBottom(messages.length > 2 ? 'smooth' : 'auto');
+    }
+  }, [messages, isUserScrolledUp, scrollToBottom]);
+
+  // Detect user scroll position
+  useEffect(() => {
+    const container = chatContainerRef.current;
+    if (!container) return;
+
+    const handleScroll = () => {
+      // Skip if this scroll was triggered by our auto-scroll
+      if (isAutoScrollingRef.current) return;
+
+      const { scrollTop, scrollHeight, clientHeight } = container;
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+      // If user is more than 150px from bottom, they've scrolled up
+      setIsUserScrolledUp(distanceFromBottom > 150);
+    };
+
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, []);
 
  useLayoutEffect(() => {
  const textarea = textareaRef.current;
@@ -271,6 +309,26 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  }
  };
 
+  const handleStopGeneration = useCallback(() => {
+  if (abortControllerRef.current) {
+  abortControllerRef.current.abort();
+  abortControllerRef.current = null;
+  }
+  setIsGenerating(false);
+  setWasStopped(true);
+  // Remove isTyping flag from all messages so the dots stop
+  setMessages(prev => prev.map(m => m.isTyping ? { ...m, isTyping: false } : m));
+  }, []);
+
+  const handleEditPrompt = useCallback(() => {
+  const prompt = lastUserPromptRef.current;
+  if (!prompt) return;
+  setInputValue(prompt);
+  setWasStopped(false);
+  // Focus the textarea after loading the prompt
+  setTimeout(() => textareaRef.current?.focus(), 50);
+  }, []);
+
  const handleSendMessage = async (e) => {
  if (e) e.preventDefault();
  if (!inputValue.trim() && !attachedFile) return;
@@ -284,9 +342,17 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  promptToSend = `[Uploaded Document: ${currentFile.name}]\n\`\`\`text\n${currentFile.content}\n\`\`\`\n\nUser Question: ${basePrompt || "Analyze the provided document contents."}`;
  }
 
+  // Store the raw user prompt for potential edit-and-resend
+  lastUserPromptRef.current = basePrompt;
+
  setInputValue('');
  setAttachedFile(null);
  setIsGenerating(true);
+  setWasStopped(false);
+
+  // Create an AbortController for this request
+  const controller = new AbortController();
+  abortControllerRef.current = controller;
 
  // ===== GUEST MODE: ephemeral session-only chat =====
  if (isGuest) {
@@ -332,7 +398,8 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  body: JSON.stringify({
  messages: sessionHistory,
  content: promptToSend
- })
+ }),
+ signal: controller.signal
  });
 
  if (!res.ok) throw new Error('Streaming connection dropped');
@@ -380,21 +447,35 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  });
 
  } catch (err) {
- console.error('Guest streaming error:', err);
- const errorContent = 'Failed to retrieve response from server. Verify connection configurations.';
- setMessages((prev) =>
- prev.map((m) =>
- m.message_id === tempAiMsgId
- ? { ...m, content: errorContent, isTyping: false }
- : m
- )
- );
- // Also save error message to ref so useEffect won't wipe it
- guestMessagesRef.current[currentConvId].push({
- message_id: tempAiMsgId, role: 'assistant', content: errorContent
- });
+  if (err.name === 'AbortError') {
+  // User clicked Stop — preserve partial response
+  const partialContent = accumulatedResponse || '';
+  if (partialContent && guestMessagesRef.current[currentConvId]) {
+  guestMessagesRef.current[currentConvId].push({
+  message_id: tempAiMsgId, role: 'assistant', content: partialContent
+  });
+  }
+  setMessages(prev => prev.map(m =>
+  m.message_id === tempAiMsgId ? { ...m, isTyping: false } : m
+  ));
+  } else {
+  console.error('Guest streaming error:', err);
+  const errorContent = 'Failed to retrieve response from server. Verify connection configurations.';
+  setMessages((prev) =>
+  prev.map((m) =>
+  m.message_id === tempAiMsgId
+  ? { ...m, content: errorContent, isTyping: false }
+  : m
+  )
+  );
+  // Also save error message to ref so useEffect won't wipe it
+  guestMessagesRef.current[currentConvId].push({
+  message_id: tempAiMsgId, role: 'assistant', content: errorContent
+  });
+  }
  } finally {
- setIsGenerating(false);
+  abortControllerRef.current = null;
+  setIsGenerating(false);
  }
  return;
  }
@@ -443,7 +524,8 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  body: JSON.stringify({
  conversation_id: currentConvId || 'anonymous-thread',
  content: promptToSend
- })
+ }),
+ signal: controller.signal
  });
 
  if (!res.ok) throw new Error('Streaming connection dropped');
@@ -487,16 +569,24 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  }
 
  } catch (err) {
- console.error('Streaming error runtime fault:', err);
- setMessages((prev) =>
- prev.map((m) =>
- m.message_id === tempAiMsgId
- ? { ...m, content: 'Failed to retrieve response from server. Verify connection configurations.', isTyping: false }
- : m
- )
- );
+  if (err.name === 'AbortError') {
+  // User clicked Stop — preserve partial response
+  setMessages(prev => prev.map(m =>
+  m.message_id === tempAiMsgId ? { ...m, isTyping: false } : m
+  ));
+  } else {
+  console.error('Streaming error runtime fault:', err);
+  setMessages((prev) =>
+  prev.map((m) =>
+  m.message_id === tempAiMsgId
+  ? { ...m, content: 'Failed to retrieve response from server. Verify connection configurations.', isTyping: false }
+  : m
+  )
+  );
+  }
  } finally {
- setIsGenerating(false);
+  abortControllerRef.current = null;
+  setIsGenerating(false);
  }
  };
 
@@ -713,93 +803,127 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  </header>
 
  {/* Chat Content Scroll Canvas */}
- <div className="flex-1 min-h-0 overflow-y-auto scrollbar-hide pb-2">
- <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 md:gap-6 px-3 md:px-md py-4 md:py-lg lg:px-10 xl:px-16">
- {messages.map((msg) => (
- <div key={msg.message_id || msg.id}>
- {msg.role === 'user' ? (
- <div className="flex justify-end animate-in slide-in-from-right-4 duration-500 my-1 md:my-2">
- <div className="max-w-[92%] sm:max-w-[85%] lg:max-w-[75%] glass-panel rounded-2xl rounded-tr-none p-3 md:p-md text-on-surface">
- <div className="font-body-md text-[14px] md:text-body-md whitespace-pre-wrap break-words">
- <ReactMarkdown children={msg.content} />
- </div>
- </div>
- </div>
- ) : (
- <div className="flex justify-start gap-2 md:gap-md animate-in slide-in-from-left-4 duration-700 my-2 md:my-4">
- <div className="w-8 h-8 md:w-10 md:h-10 shrink-0 rounded-xl bg-gradient-to-br from-primary-container to-secondary-container flex items-center justify-center ai-glow mt-1">
- <span className="material-symbols-outlined text-white text-[18px] md:text-[24px]" style={{ fontVariationSettings: "'FILL' 1" }}>
- auto_awesome
- </span>
- </div>
- <div className="max-w-[88%] sm:max-w-[85%] lg:max-w-[82%] w-full space-y-md">
- <div className="space-y-2 md:space-y-sm text-on-surface">
- <div className="font-body-md text-[14px] md:text-body-md opacity-90 break-words leading-relaxed md:leading-7 markdown-container">
- <ReactMarkdown
- children={msg.content}
- components={{
- code({ node, inline, className, children, ...props }) {
- const match = /language-(\w+)/.exec(className || '');
- return !inline && match ? (
- <div className="my-3 md:my-4 overflow-hidden rounded-xl border border-outline-variant/20 shadow-2xl">
- <div className="flex items-center justify-between bg-surface-container-high px-3 md:px-md py-2 md:py-xs font-label-sm text-[11px] md:text-label-sm text-on-surface-variant border-b border-outline-variant/15">
- <span className="font-mono uppercase tracking-wider">{match[1]}</span>
- <button
- type="button"
- onClick={() => navigator.clipboard.writeText(String(children).replace(/\n$/, ''))}
- className="flex items-center gap-1 hover:text-on-surface transition-colors font-semibold"
- >
- <span className="material-symbols-outlined text-[14px]">content_copy</span>
- <span className="hidden sm:inline-block">Copy</span>
- </button>
- </div>
- <SyntaxHighlighter
- {...props}
- children={String(children).replace(/\n$/, '')}
- style={vscDarkPlus}
- language={match[1]}
- PreTag="div"
- customStyle={{
- margin: 0,
- padding: '1rem',
- fontSize: '0.8rem',
- background: '#121212',
- overflowX: 'auto'
- }}
- />
- </div>
- ) : (
- <code className="bg-surface-container-highest px-1.5 py-0.5 rounded font-mono text-[12px] md:text-sm border border-outline-variant/20 break-words" {...props}>
- {children}
- </code>
- );
- },
- p: ({ children }) => <p className="mb-3 md:mb-4 last:mb-0 whitespace-pre-wrap">{children}</p>,
- ul: ({ children }) => <ul className="list-disc pl-4 md:pl-md space-y-1 mb-3 md:mb-4">{children}</ul>,
- ol: ({ children }) => <ol className="list-decimal pl-4 md:pl-md space-y-1 mb-3 md:mb-4">{children}</ol>,
- li: ({ children }) => <li className="marker:text-primary">{children}</li>,
- h1: ({ children }) => <h1 className="text-xl md:text-2xl font-bold mt-4 md:mt-md mb-2 text-primary">{children}</h1>,
- h2: ({ children }) => <h2 className="text-lg md:text-xl font-bold mt-3 md:mt-sm mb-2 text-secondary">{children}</h2>,
- h3: ({ children }) => <h3 className="text-base md:text-lg font-bold mt-2 md:mt-sm mb-1">{children}</h3>,
- }}
- />
- </div>
- {msg.isTyping && (
- <div className="flex gap-1.5 items-center py-2">
- <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0s' }}></span>
- <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
- <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></span>
- </div>
- )}
- </div>
- </div>
- </div>
- )}
- </div>
- ))}
- <div ref={messagesEndRef} />
- </div>
- </div>
+ <div className="relative flex-1 min-h-0">
+          <div ref={chatContainerRef} className="h-full overflow-y-auto chat-scrollbar pb-2">
+            <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 md:gap-6 px-3 md:px-md py-4 md:py-lg lg:px-10 xl:px-16">
+            {messages.map((msg) => {
+              const isLastUserMsg = msg.role === 'user' && msg.message_id === messages.filter(m => m.role === 'user').at(-1)?.message_id;
+              return (
+              <div key={msg.message_id || msg.id}>
+              {msg.role === 'user' ? (
+              <div className="flex justify-end animate-in slide-in-from-right-4 duration-500 my-1 md:my-2 group/user-msg">
+              <div className="flex items-end gap-1.5">
+              {/* Edit icon — only on the last user message when generation was stopped */}
+              {wasStopped && !isGenerating && isLastUserMsg && (
+              <button
+              type="button"
+              onClick={handleEditPrompt}
+              className="edit-prompt-btn mb-1"
+              title="Edit and resend prompt"
+              aria-label="Edit and resend prompt"
+              >
+              <span className="material-symbols-outlined" style={{ fontSize: '16px' }}>edit</span>
+              </button>
+              )}
+              <div className="max-w-[92%] sm:max-w-[85%] lg:max-w-[75%] glass-panel rounded-2xl rounded-tr-none p-3 md:p-md text-on-surface">
+              <div className="font-body-md text-[14px] md:text-body-md whitespace-pre-wrap break-words">
+              <ReactMarkdown children={msg.content} />
+              </div>
+              </div>
+              </div>
+              </div>
+              ) : (
+              <div className="flex justify-start gap-2 md:gap-md animate-in slide-in-from-left-4 duration-700 my-2 md:my-4">
+              <div className="w-8 h-8 md:w-10 md:h-10 shrink-0 rounded-xl bg-gradient-to-br from-primary-container to-secondary-container flex items-center justify-center ai-glow mt-1">
+              <span className="material-symbols-outlined text-white text-[18px] md:text-[24px]" style={{ fontVariationSettings: "'FILL' 1" }}>
+              auto_awesome
+              </span>
+              </div>
+              <div className="max-w-[88%] sm:max-w-[85%] lg:max-w-[82%] w-full space-y-md">
+              <div className="space-y-2 md:space-y-sm text-on-surface">
+              <div className="font-body-md text-[14px] md:text-body-md opacity-90 break-words leading-relaxed md:leading-7 markdown-container">
+              <ReactMarkdown
+              children={msg.content}
+              components={{
+              code({ node, inline, className, children, ...props }) {
+              const match = /language-(\w+)/.exec(className || '');
+              return !inline && match ? (
+              <div className="my-3 md:my-4 overflow-hidden rounded-xl border border-outline-variant/20 shadow-2xl">
+              <div className="flex items-center justify-between bg-surface-container-high px-3 md:px-md py-2 md:py-xs font-label-sm text-[11px] md:text-label-sm text-on-surface-variant border-b border-outline-variant/15">
+              <span className="font-mono uppercase tracking-wider">{match[1]}</span>
+              <button
+              type="button"
+              onClick={() => navigator.clipboard.writeText(String(children).replace(/\n$/, ''))}
+              className="flex items-center gap-1 hover:text-on-surface transition-colors font-semibold"
+              >
+              <span className="material-symbols-outlined text-[14px]">content_copy</span>
+              <span className="hidden sm:inline-block">Copy</span>
+              </button>
+              </div>
+              <SyntaxHighlighter
+              {...props}
+              children={String(children).replace(/\n$/, '')}
+              style={vscDarkPlus}
+              language={match[1]}
+              PreTag="div"
+              customStyle={{
+              margin: 0,
+              padding: '1rem',
+              fontSize: '0.8rem',
+              background: '#121212',
+              overflowX: 'auto'
+              }}
+              />
+              </div>
+              ) : (
+              <code className="bg-surface-container-highest px-1.5 py-0.5 rounded font-mono text-[12px] md:text-sm border border-outline-variant/20 break-words" {...props}>
+              {children}
+              </code>
+              );
+              },
+              p: ({ children }) => <p className="mb-3 md:mb-4 last:mb-0 whitespace-pre-wrap">{children}</p>,
+              ul: ({ children }) => <ul className="list-disc pl-4 md:pl-md space-y-1 mb-3 md:mb-4">{children}</ul>,
+              ol: ({ children }) => <ol className="list-decimal pl-4 md:pl-md space-y-1 mb-3 md:mb-4">{children}</ol>,
+              li: ({ children }) => <li className="marker:text-primary">{children}</li>,
+              h1: ({ children }) => <h1 className="text-xl md:text-2xl font-bold mt-4 md:mt-md mb-2 text-primary">{children}</h1>,
+              h2: ({ children }) => <h2 className="text-lg md:text-xl font-bold mt-3 md:mt-sm mb-2 text-secondary">{children}</h2>,
+              h3: ({ children }) => <h3 className="text-base md:text-lg font-bold mt-2 md:mt-sm mb-1">{children}</h3>,
+              }}
+              />
+              </div>
+              {msg.isTyping && (
+              <div className="flex gap-1.5 items-center py-2">
+              <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0s' }}></span>
+              <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
+              <span className="w-2 md:w-2.5 h-2 md:h-2.5 bg-primary/80 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></span>
+              </div>
+              )}
+              </div>
+              </div>
+              </div>
+              )}
+              </div>
+              );
+            })}
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+
+          {/* Scroll to bottom button */}
+          {isUserScrolledUp && (
+            <button
+              onClick={() => {
+                setIsUserScrolledUp(false);
+                scrollToBottom('smooth');
+              }}
+              className="scroll-to-bottom-btn"
+              title="Scroll to bottom"
+              aria-label="Scroll to bottom"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: '22px' }}>keyboard_arrow_down</span>
+            </button>
+          )}
+        </div>
 
  {/* Form Interactive Input Control Tray */}
  <div className="sticky bottom-0 z-20 w-full border-t border-outline-variant/10 bg-surface/90 md:bg-gradient-to-t md:from-surface md:via-surface/96 md:to-surface/75 backdrop-blur-xl">
@@ -897,13 +1021,24 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  Search
  </div>
  </div>
- <button
- type="submit"
- disabled={isGenerating || (!inputValue.trim() && !attachedFile)}
- className="w-8 h-8 md:w-10 md:h-10 bg-primary-container text-on-primary-container rounded-lg md:rounded-xl flex items-center justify-center shadow-lg active:scale-90 transition-transform disabled:opacity-40"
- >
- <span className="material-symbols-outlined text-[18px] md:text-[24px]">arrow_upward</span>
- </button>
+  {isGenerating ? (
+  <button
+  type="button"
+  onClick={handleStopGeneration}
+  className="send-stop-btn stop-active"
+  title="Stop generating"
+  >
+  <span className="material-symbols-outlined text-[18px] md:text-[20px]">stop</span>
+  </button>
+  ) : (
+  <button
+  type="submit"
+  disabled={!inputValue.trim() && !attachedFile}
+  className="send-stop-btn send-active"
+  >
+  <span className="material-symbols-outlined text-[18px] md:text-[24px]">arrow_upward</span>
+  </button>
+  )}
  </div>
  </form>
  <p className="mt-1 md:mt-sm text-[9px] md:text-[11px] text-on-surface-variant/40 font-label-sm mb-1 text-center">
