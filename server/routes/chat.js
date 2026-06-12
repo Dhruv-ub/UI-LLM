@@ -4,9 +4,7 @@ import db from '../db.js';
 import { authenticateToken } from './auth.js';
 import fetch from 'node-fetch';
 import multer from 'multer';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse');
+import { PDFParse } from 'pdf-parse';
 
 const router = express.Router();
 
@@ -23,8 +21,14 @@ const parseUploadedFile = async (file) => {
   let extractedText = '';
 
   if (ext === 'pdf' || mimetype === 'application/pdf') {
-    const pdfData = await pdfParse(buffer);
-    extractedText = pdfData.text;
+    // pdf-parse v2.x: PDFParse is a class, not a function
+    const pdf = new PDFParse({ data: new Uint8Array(buffer) });
+    try {
+      const textResult = await pdf.getText();
+      extractedText = textResult.text;
+    } finally {
+      await pdf.destroy();
+    }
   } else {
     extractedText = buffer.toString('utf-8');
   }
