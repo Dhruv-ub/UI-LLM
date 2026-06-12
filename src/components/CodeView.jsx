@@ -812,7 +812,7 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
               <div key={msg.message_id || msg.id}>
               {msg.role === 'user' ? (
               <div className="flex justify-end animate-in slide-in-from-right-4 duration-500 my-1 md:my-2 group/user-msg">
-              <div className="flex items-end gap-1.5">
+              <div className="flex items-end gap-1.5 w-full justify-end">
               {/* Edit icon — only on the last user message when generation was stopped */}
               {wasStopped && !isGenerating && isLastUserMsg && (
               <button
@@ -825,7 +825,7 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
               <span className="material-symbols-outlined" style={{ fontSize: '16px' }}>edit</span>
               </button>
               )}
-              <div className="max-w-[92%] sm:max-w-[85%] lg:max-w-[75%] glass-panel rounded-2xl rounded-tr-none p-3 md:p-md text-on-surface">
+              <div className="w-fit max-w-[92%] sm:max-w-[85%] lg:max-w-[75%] glass-panel rounded-2xl rounded-tr-none p-3 md:p-md text-on-surface">
               <div className="font-body-md text-[14px] md:text-body-md whitespace-pre-wrap break-words">
               <ReactMarkdown children={msg.content} />
               </div>
