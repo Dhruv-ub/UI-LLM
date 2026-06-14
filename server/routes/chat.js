@@ -244,6 +244,42 @@ router.post('/messages', authenticateToken, async (req, res) => {
       [conversation_id]
     );
 
+    let completeAiResponse = "";
+    let clientDisconnected = false;
+    let streamCompleted = false;
+    let hasCommittedAssistantMessage = false;
+    let llamaReader = null;
+    const llamaAbortController = new AbortController();
+
+    const commitAssistantMessage = async () => {
+      if (hasCommittedAssistantMessage) return;
+      hasCommittedAssistantMessage = true;
+
+      try {
+        const approxTokenCount = Math.round(completeAiResponse.length / 4);
+        await db.query(
+          'UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?',
+          [completeAiResponse, approxTokenCount, assistantMessageId]
+        );
+      } catch (dbErr) {
+        hasCommittedAssistantMessage = false;
+        console.error('Failed to commit assistant message string to database:', dbErr);
+      }
+    };
+
+    res.on('close', () => {
+      if (streamCompleted) return;
+
+      clientDisconnected = true;
+      llamaAbortController.abort();
+
+      if (llamaReader?.destroy) {
+        llamaReader.destroy();
+      }
+
+      void commitAssistantMessage();
+    });
+
     // 5. Configure Headers for genuine Server-Sent Events (SSE) stream back to frontend
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -257,13 +293,11 @@ router.post('/messages', authenticateToken, async (req, res) => {
       assistantMessageId 
     })}\n\n`);
 
-    // 6. Connect directly to llama-server Stream Pipeline
-    let completeAiResponse = "";
-
     try {
       const llamaResponse = await fetch('http://localhost:8080/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: llamaAbortController.signal,
         body: JSON.stringify({
           messages: formattedHistory, // Local history array gives it memory natively!
           stream: true                 // Instructs llama-server to output chunked text
@@ -275,13 +309,13 @@ router.post('/messages', authenticateToken, async (req, res) => {
       }
 
       // Read llama-server response stream line-by-line
-      const reader = llamaResponse.body;
-      reader.setEncoding('utf8');
+      llamaReader = llamaResponse.body;
+      llamaReader.setEncoding('utf8');
 
       let buffer = '';
 
       await new Promise((resolve, reject) => {
-        reader.on('data', (chunk) => {
+        llamaReader.on('data', (chunk) => {
           buffer += chunk;
           const lines = buffer.split('\n');
           
@@ -300,7 +334,9 @@ router.post('/messages', authenticateToken, async (req, res) => {
                 if (tokenContent) {
                   completeAiResponse += tokenContent;
                   // Immediately pass the token along to your frontend listener
-                  res.write(`data: ${JSON.stringify({ chunk: tokenContent })}\n\n`);
+                  if (!clientDisconnected && !res.writableEnded) {
+                    res.write(`data: ${JSON.stringify({ chunk: tokenContent })}\n\n`);
+                  }
                 }
               } catch (jsonErr) {
                 // Skips incomplete chunks gracefully
@@ -309,29 +345,34 @@ router.post('/messages', authenticateToken, async (req, res) => {
           }
         });
 
-        reader.on('end', () => resolve());
-        reader.on('error', (err) => reject(err));
+        llamaReader.on('end', () => resolve());
+        llamaReader.on('error', (err) => {
+          if (clientDisconnected) {
+            resolve();
+          } else {
+            reject(err);
+          }
+        });
       });
 
     } catch (llamaErr) {
-      console.error("Critical error communicating with llama-server:", llamaErr);
-      completeAiResponse = "\n\n**Backend Connection Error:** Failed to establish communication with llama-server. Ensure it's running locally on port 8080.";
-      res.write(`data: ${JSON.stringify({ chunk: completeAiResponse })}\n\n`);
+      if (!clientDisconnected) {
+        console.error("Critical error communicating with llama-server:", llamaErr);
+        completeAiResponse = "\n\n**Backend Connection Error:** Failed to establish communication with llama-server. Ensure it's running locally on port 8080.";
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ chunk: completeAiResponse })}\n\n`);
+        }
+      }
     }
 
     // 7. Stream Termination - Write final accumulated token generation back to MySQL
-    try {
-      const approxTokenCount = Math.round(completeAiResponse.length / 4); 
-      await db.query(
-        'UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?',
-        [completeAiResponse, approxTokenCount, assistantMessageId]
-      );
-    } catch (dbErr) {
-      console.error('Failed to commit final assistant message string to database:', dbErr);
-    }
+    await commitAssistantMessage();
+
+    if (clientDisconnected || res.writableEnded) return;
 
     // Signal frontend that the stream is officially finished
     res.write('data: [DONE]\n\n');
+    streamCompleted = true;
     res.end();
 
   } catch (err) {

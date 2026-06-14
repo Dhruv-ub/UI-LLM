@@ -31,6 +31,7 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
   const [wasStopped, setWasStopped] = useState(false);
   const abortControllerRef = useRef(null);
   const lastUserPromptRef = useRef('');
+  const skipNextMessageReloadRef = useRef(false);
 
  const messagesEndRef = useRef(null);
  const chatContainerRef = useRef(null);
@@ -125,6 +126,10 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  // Load messages for active conversation (guest or authenticated)
  useEffect(() => {
  if (activeConvId && !isGenerating) {
+ if (skipNextMessageReloadRef.current) {
+ skipNextMessageReloadRef.current = false;
+ return;
+ }
  if (isGuest) {
  // Guest mode: load from in-memory store
  const guestMsgs = guestMessagesRef.current[activeConvId];
@@ -311,10 +316,10 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
 
   const handleStopGeneration = useCallback(() => {
   if (abortControllerRef.current) {
+  skipNextMessageReloadRef.current = true;
   abortControllerRef.current.abort();
   abortControllerRef.current = null;
   }
-  setIsGenerating(false);
   setWasStopped(true);
   // Remove isTyping flag from all messages so the dots stop
   setMessages(prev => prev.map(m => m.isTyping ? { ...m, isTyping: false } : m));
@@ -391,6 +396,8 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  .filter(m => m.message_id !== 'welcome-1')
  .map(m => ({ role: m.role, content: m.content }));
 
+ let accumulatedResponse = '';
+
  try {
  const res = await fetch(`${API_BASE}/guest/messages`, {
  method: 'POST',
@@ -407,7 +414,6 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  const reader = res.body.getReader();
  const decoder = new TextDecoder();
  let done = false;
- let accumulatedResponse = '';
 
  while (!done) {
  const { value, done: doneReading } = await reader.read();
