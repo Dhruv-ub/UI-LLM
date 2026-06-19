@@ -13,6 +13,7 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  const [messages, setMessages] = useState([]);
  const [inputValue, setInputValue] = useState('');
  const [isGenerating, setIsGenerating] = useState(false);
+ const [showCredits, setShowCredits] = useState(false);
 
  // Guest session state — ephemeral, lost on refresh (like ChatGPT/Gemini when not logged in)
  const [guestConversations, setGuestConversations] = useState([]);
@@ -274,6 +275,13 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  }
  return () => document.removeEventListener('mousedown', handleClickOutside);
  }, [isUploadMenuOpen]);
+
+ // Close credits modal on Escape key
+ useEffect(() => {
+ const handleEsc = (e) => { if (e.key === 'Escape') setShowCredits(false); };
+ if (showCredits) document.addEventListener('keydown', handleEsc);
+ return () => document.removeEventListener('keydown', handleEsc);
+ }, [showCredits]);
 
  const handleFileChange = async (e) => {
  const file = e.target.files[0];
@@ -743,6 +751,15 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  <span>Access Account</span>
  </button>
  )}
+{/* Credits link */}
+<button
+  onClick={() => setShowCredits(true)}
+  className="w-full flex items-center justify-center gap-2 mt-3 py-2 rounded-lg text-sm text-on-surface-variant/80 hover:text-on-surface font-medium hover:bg-surface-container-high cursor-pointer transition-all duration-200"
+  type="button"
+>
+  <span className="material-symbols-outlined text-base">info</span>
+  <span>Credits</span>
+</button>
  </div>
  </div>
  </aside>
@@ -1053,6 +1070,61 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  </div>
  </div>
  </main>
+
+ {/* Credits Modal */}
+ {showCredits && (
+ <>
+ <div
+ className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[60]"
+ onClick={() => setShowCredits(false)}
+ aria-hidden="true"
+ />
+ <div className="fixed inset-0 z-[61] flex items-center justify-center p-4 md:p-md" onClick={() => setShowCredits(false)}>
+ <div
+ className="glass-panel rounded-2xl w-full max-w-md p-6 md:p-lg shadow-2xl"
+ style={{ animation: 'dropdownSlideUp 0.25s ease-out' }}
+ onClick={(e) => e.stopPropagation()}
+ >
+ <div className="flex items-center justify-between mb-4 md:mb-md">
+ <h2 className="font-headline-md text-headline-md text-on-surface">Credits</h2>
+ <button
+ onClick={() => setShowCredits(false)}
+ className="text-on-surface-variant hover:text-on-surface hover:bg-surface-container-highest p-1 rounded-lg transition-colors"
+ type="button"
+ >
+ <span className="material-symbols-outlined">close</span>
+ </button>
+ </div>
+ <div className="bg-surface-container-high rounded-xl border border-outline-variant/10 p-4 md:p-md mb-3">
+ <p className="font-label-sm text-[11px] uppercase tracking-wider text-on-surface-variant/60 mb-1">Made by</p>
+ <p className="font-headline-md text-[20px] font-bold custom-gradient-text">Dhruv</p>
+ <p className="font-label-sm text-label-sm text-on-surface-variant mt-1">Creator & Developer</p>
+ </div>
+ <div className="bg-surface-container-high rounded-xl border border-outline-variant/10 p-4 md:p-md mb-3">
+ <p className="font-label-sm text-[11px] uppercase tracking-wider text-on-surface-variant/60 mb-2">Technologies</p>
+ <div className="flex flex-wrap gap-1.5">
+{
+  [
+    'Artificial Intelligence',
+    'Machine Learning',
+    'Natural Language Processing',
+    'Secure Authentication'
+  ].map((tech) => ( <span key={tech} className="px-2.5 py-1 bg-surface-container-highest rounded-lg text-[12px] font-label-sm text-on-surface-variant border border-outline-variant/10">
+ {tech}
+ </span>
+ ))}
+ </div>
+ </div>
+ <div className="bg-surface-container-high rounded-xl border border-outline-variant/10 p-4 md:p-md">
+ <div className="flex items-center justify-between">
+ <p className="font-label-sm text-[11px] uppercase tracking-wider text-on-surface-variant/60">Version</p>
+ <span className="font-label-sm text-label-sm text-primary font-semibold">0.0.0</span>
+ </div>
+ </div>
+ </div>
+ </div>
+ </>
+ )}
  </div>
  );
 }
