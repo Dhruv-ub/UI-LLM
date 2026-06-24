@@ -4,9 +4,36 @@ import db from '../db.js';
 import { authenticateToken } from './auth.js';
 import fetch from 'node-fetch';
 import multer from 'multer';
-import { PDFParse } from 'pdf-parse';
+
+// Import our new Dual-RAG system (Updated to use parseDocument)
+// import { 
+//   getEmbedding, 
+//   chunkText, 
+//   parseDocument, 
+//   globalVectorStore, 
+//   sessionVectorStore, 
+//   cosineSimilarity 
+// } from '../rag.js';
 
 const router = express.Router();
+
+// ============================================================
+// UPDATE MODEL API ENDPOINTS HERE
+// Keep the keys ("flash" and "pro") matched with AVAILABLE_MODELS
+// in src/components/CodeView.jsx.
+// ============================================================
+const MODEL_API_ENDPOINTS = {
+  flash: 'http://localhost:8080/v1/chat/completions', // <-- UPDATE FLASH API HERE
+  pro: 'http://localhost:8081/v1/chat/completions',   // <-- UPDATE PRO API HERE
+};
+
+const DEFAULT_MODEL_ID = 'flash';
+
+const resolveModel = (modelId) => {
+  const resolvedModelId = modelId || DEFAULT_MODEL_ID;
+  const endpoint = MODEL_API_ENDPOINTS[resolvedModelId];
+  return endpoint ? { id: resolvedModelId, endpoint } : null;
+};
 
 // Multer memory storage for file uploads (no disk writes)
 const upload = multer({
@@ -14,50 +41,84 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
 });
 
-// Shared file parsing helper
-const parseUploadedFile = async (file) => {
-  const { originalname, mimetype, buffer } = file;
-  const ext = originalname.split('.').pop().toLowerCase();
-  let extractedText = '';
-
-  if (ext === 'pdf' || mimetype === 'application/pdf') {
-    // pdf-parse v2.x: PDFParse is a class, not a function
-    const pdf = new PDFParse({ data: new Uint8Array(buffer) });
-    try {
-      const textResult = await pdf.getText();
-      extractedText = textResult.text;
-    } finally {
-      await pdf.destroy();
-    }
-  } else {
-    extractedText = buffer.toString('utf-8');
-  }
-
-  return { filename: originalname, content: extractedText, size: buffer.length };
-};
-
-// FILE UPLOAD: POST /upload — Extract text from PDF, CSV, or text files (authenticated)
+// FILE UPLOAD: POST /upload — Processes UI uploads for Session RAG
 router.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ status: 'error', message: 'No file provided' });
+    // IMPORTANT: Make sure your frontend sends 'conversation_id' in the FormData!
+    const conversation_id = req.body.conversation_id; 
+    
+    if (!req.file || !conversation_id) {
+      return res.status(400).json({ status: 'error', message: 'File and conversation_id required' });
     }
-    const result = await parseUploadedFile(req.file);
-    return res.status(200).json({ status: 'success', ...result });
+
+    const { originalname, mimetype, buffer } = req.file;
+    const ext = originalname.split('.').pop().toLowerCase();
+    let extractedText = '';
+
+    // 1. Extract Text (Now supports PDF and DOCX)
+    if (
+        ['pdf', 'docx'].includes(ext) || 
+        mimetype === 'application/pdf' || 
+        mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
+      extractedText = await parseDocument(buffer, originalname);
+    } else {
+      extractedText = buffer.toString('utf-8');
+    }
+
+    // 2. Chunk and Embed the UI-uploaded text
+    const chunks = chunkText(extractedText);
+    const embeddedChunks = [];
+    
+    for (const chunk of chunks) {
+        const vector = await getEmbedding(chunk);
+        embeddedChunks.push({
+            source: `UI Upload: ${originalname}`,
+            text: chunk,
+            vector: vector
+        });
+    }
+
+    // 3. Save to the Session Store mapped to this specific chat
+    const existingSessionDocs = sessionVectorStore.get(conversation_id) || [];
+    sessionVectorStore.set(conversation_id, [...existingSessionDocs, ...embeddedChunks]);
+
+    return res.status(200).json({ 
+      status: 'success', 
+      filename: originalname, 
+      content: extractedText,
+      chunksProcessed: chunks.length 
+    });
   } catch (err) {
     console.error('File Upload Processing Error:', err);
     return res.status(500).json({ status: 'error', message: 'Failed to process uploaded file' });
   }
 });
 
-// GUEST FILE UPLOAD: POST /guest/upload — Same parsing but no auth required
+// GUEST FILE UPLOAD: POST /guest/upload
+// (Guests don't have DB conversation_ids, so we just return the text without saving to the vector store)
 router.post('/guest/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ status: 'error', message: 'No file provided' });
     }
-    const result = await parseUploadedFile(req.file);
-    return res.status(200).json({ status: 'success', ...result });
+    
+    const { originalname, mimetype, buffer } = req.file;
+    const ext = originalname.split('.').pop().toLowerCase();
+    
+    const isDocument = ['pdf', 'docx'].includes(ext) || 
+                       mimetype === 'application/pdf' || 
+                       mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+    let extractedText = isDocument 
+      ? await parseDocument(buffer, originalname) 
+      : buffer.toString('utf-8');
+
+    return res.status(200).json({ 
+      status: 'success', 
+      filename: originalname, 
+      content: extractedText 
+    });
   } catch (err) {
     console.error('Guest File Upload Processing Error:', err);
     return res.status(500).json({ status: 'error', message: 'Failed to process uploaded file' });
@@ -191,11 +252,19 @@ router.get('/messages/:conversationId', authenticateToken, async (req, res) => {
 
 // 6. POST /messages (Submit prompt and connect to local llama-server stream)
 router.post('/messages', authenticateToken, async (req, res) => {
-  const { conversation_id, content } = req.body;
+  const { conversation_id, content, model } = req.body;
   const user_id = req.user.id;
+  const selectedModel = resolveModel(model);
 
   if (!conversation_id || !content) {
     return res.status(400).json({ status: 'error', message: 'Conversation ID and message content required' });
+  }
+
+  if (!selectedModel) {
+    return res.status(400).json({
+      status: 'error',
+      message: `Unknown model "${model}". Allowed models: ${Object.keys(MODEL_API_ENDPOINTS).join(', ')}`
+    });
   }
 
   try {
@@ -209,20 +278,53 @@ router.post('/messages', authenticateToken, async (req, res) => {
       return res.status(403).json({ status: 'error', message: 'Unauthorized access to conversation' });
     }
 
-    // 2. Fetch entire chat history for Context Management
+    // 2. Fetch entire chat history
     const [pastMessages] = await db.query(
       'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC',
       [conversation_id]
     );
 
-    // Map DB rows to standard format: [{role: "user", content: "..."}]
     const formattedHistory = pastMessages.map(msg => ({
       role: msg.role,
       content: msg.content
     }));
 
-    // Add the fresh incoming prompt to the context array
+    // Add user prompt to history
     formattedHistory.push({ role: 'user', content: content });
+
+    // ==========================================
+    // DUAL-RAG RETRIEVAL (Global + Session)
+    // ==========================================
+    const sessionDocs = sessionVectorStore.get(conversation_id) || [];
+    const combinedKnowledgeBase = [...globalVectorStore, ...sessionDocs];
+    
+    let systemPromptContent = "You are a highly intelligent assistant.";
+
+    if (combinedKnowledgeBase.length > 0) {
+        const queryVector = await getEmbedding(content);
+
+        const scoredChunks = combinedKnowledgeBase.map(doc => ({
+            source: doc.source,
+            text: doc.text,
+            score: cosineSimilarity(queryVector, doc.vector)
+        }));
+
+        scoredChunks.sort((a, b) => b.score - a.score);
+        
+        const topChunks = scoredChunks
+            .filter(c => c.score > 0.5) 
+            .slice(0, 5)
+            .map(c => `[Source: ${c.source}]\n${c.text}`)
+            .join("\n\n");
+
+        if (topChunks) {
+            systemPromptContent = `You are an expert analyst. Answer the user's question using ONLY the provided context below. The context may come from a global database or user-uploaded files. If the answer is not contained in the context, explicitly state "I do not have information regarding that."\n\n=== CONTEXT ===\n${topChunks}`;
+        }
+    }
+
+    // Inject System Prompt
+    formattedHistory.unshift({ role: 'system', content: systemPromptContent });
+    // ==========================================
 
     // 3. Insert User Query Message into DB
     const userMessageId = crypto.randomUUID();
@@ -238,7 +340,6 @@ router.post('/messages', authenticateToken, async (req, res) => {
       [assistantMessageId, conversation_id, 'assistant', '']
     );
 
-    // Update conversation timestamp (bumps chat to top of sidebar)
     await db.query(
       'UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?',
       [conversation_id]
@@ -269,38 +370,29 @@ router.post('/messages', authenticateToken, async (req, res) => {
 
     res.on('close', () => {
       if (streamCompleted) return;
-
       clientDisconnected = true;
       llamaAbortController.abort();
-
       if (llamaReader?.destroy) {
         llamaReader.destroy();
       }
-
       void commitAssistantMessage();
     });
 
-    // 5. Configure Headers for genuine Server-Sent Events (SSE) stream back to frontend
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); 
 
-    // Initial event payload containing structural IDs
-    res.write(`data: ${JSON.stringify({ 
-      meta: true, 
-      userMessageId, 
-      assistantMessageId 
-    })}\n\n`);
+    res.write(`data: ${JSON.stringify({ meta: true, userMessageId, assistantMessageId })}\n\n`);
 
     try {
-      const llamaResponse = await fetch('http://localhost:8080/v1/chat/completions', {
+      const llamaResponse = await fetch(selectedModel.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: llamaAbortController.signal,
         body: JSON.stringify({
-          messages: formattedHistory, // Local history array gives it memory natively!
-          stream: true                 // Instructs llama-server to output chunked text
+          messages: formattedHistory,
+          stream: true
         })
       });
 
@@ -308,18 +400,14 @@ router.post('/messages', authenticateToken, async (req, res) => {
         throw new Error(`llama-server returned status: ${llamaResponse.status}`);
       }
 
-      // Read llama-server response stream line-by-line
       llamaReader = llamaResponse.body;
       llamaReader.setEncoding('utf8');
-
       let buffer = '';
 
       await new Promise((resolve, reject) => {
         llamaReader.on('data', (chunk) => {
           buffer += chunk;
           const lines = buffer.split('\n');
-          
-          // Save trailing line fragments back to buffer
           buffer = lines.pop();
 
           for (const line of lines) {
@@ -333,13 +421,12 @@ router.post('/messages', authenticateToken, async (req, res) => {
 
                 if (tokenContent) {
                   completeAiResponse += tokenContent;
-                  // Immediately pass the token along to your frontend listener
                   if (!clientDisconnected && !res.writableEnded) {
                     res.write(`data: ${JSON.stringify({ chunk: tokenContent })}\n\n`);
                   }
                 }
-              } catch (jsonErr) {
-                // Skips incomplete chunks gracefully
+              } catch {
+                // Ignore incomplete SSE fragments; the next chunk completes them.
               }
             }
           }
@@ -347,30 +434,25 @@ router.post('/messages', authenticateToken, async (req, res) => {
 
         llamaReader.on('end', () => resolve());
         llamaReader.on('error', (err) => {
-          if (clientDisconnected) {
-            resolve();
-          } else {
-            reject(err);
-          }
+          if (clientDisconnected) resolve();
+          else reject(err);
         });
       });
 
     } catch (llamaErr) {
       if (!clientDisconnected) {
         console.error("Critical error communicating with llama-server:", llamaErr);
-        completeAiResponse = "\n\n**Backend Connection Error:** Failed to establish communication with llama-server. Ensure it's running locally on port 8080.";
+        completeAiResponse = `\n\n**Backend Connection Error:** Failed to establish communication with the selected model server (${selectedModel.id}). Check its API endpoint in server/routes/chat.js.`;
         if (!res.writableEnded) {
           res.write(`data: ${JSON.stringify({ chunk: completeAiResponse })}\n\n`);
         }
       }
     }
 
-    // 7. Stream Termination - Write final accumulated token generation back to MySQL
     await commitAssistantMessage();
 
     if (clientDisconnected || res.writableEnded) return;
 
-    // Signal frontend that the stream is officially finished
     res.write('data: [DONE]\n\n');
     streamCompleted = true;
     res.end();
@@ -386,31 +468,71 @@ router.post('/messages', authenticateToken, async (req, res) => {
 
 // ============================================================
 // GUEST (ANONYMOUS) CHAT — No auth, no DB persistence
-// Session-only: frontend keeps messages in memory
 // ============================================================
 
 router.post('/guest/messages', async (req, res) => {
-  const { messages: chatHistory, content } = req.body;
+  const { messages: chatHistory, content, model } = req.body;
+  const selectedModel = resolveModel(model);
 
   if (!content) {
     return res.status(400).json({ status: 'error', message: 'Message content is required' });
   }
 
+  if (!selectedModel) {
+    return res.status(400).json({
+      status: 'error',
+      message: `Unknown model "${model}". Allowed models: ${Object.keys(MODEL_API_ENDPOINTS).join(', ')}`
+    });
+  }
+
   try {
-    // Build message array from frontend-supplied session history
     const formattedHistory = Array.isArray(chatHistory) ? [...chatHistory] : [];
+
+    // The current UI includes the just-submitted user message in chatHistory.
+    // Replace that display copy with the canonical content below so the model
+    // receives the prompt exactly once (including full uploaded-file content).
+    if (formattedHistory.at(-1)?.role === 'user') {
+      formattedHistory.pop();
+    }
+
     formattedHistory.push({ role: 'user', content });
 
-    // Configure SSE headers
+    // ==========================================
+    // GLOBAL RAG ONLY FOR GUESTS
+    // ==========================================
+    // let systemPromptContent = "You are a highly intelligent assistant.";
+
+    // if (globalVectorStore.length > 0) {
+    //     const queryVector = await getEmbedding(content);
+    //     const scoredChunks = globalVectorStore.map(doc => ({
+    //         source: doc.source,
+    //         text: doc.text,
+    //         score: cosineSimilarity(queryVector, doc.vector)
+    //     }));
+
+    //     scoredChunks.sort((a, b) => b.score - a.score);
+        
+    //     const topChunks = scoredChunks
+    //         .filter(c => c.score > 0.5) 
+    //         .slice(0, 5)
+    //         .map(c => `[Source: ${c.source}]\n${c.text}`)
+    //         .join("\n\n");
+
+    //     if (topChunks) {
+    //         systemPromptContent = `You are an expert analyst. Answer the user's question using ONLY the provided context below.\n\n=== CONTEXT ===\n${topChunks}`;
+    //     }
+    // }
+
+    // formattedHistory.unshift({ role: 'system', content: systemPromptContent });
+    // // ==========================================
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    let completeAiResponse = '';
-
     try {
-      const llamaResponse = await fetch('http://localhost:8080/v1/chat/completions', {
+      const llamaResponse = await fetch(selectedModel.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -425,7 +547,6 @@ router.post('/guest/messages', async (req, res) => {
 
       const reader = llamaResponse.body;
       reader.setEncoding('utf8');
-
       let buffer = '';
 
       await new Promise((resolve, reject) => {
@@ -444,11 +565,10 @@ router.post('/guest/messages', async (req, res) => {
                 const tokenContent = parsedJson.choices[0]?.delta?.content || '';
 
                 if (tokenContent) {
-                  completeAiResponse += tokenContent;
                   res.write(`data: ${JSON.stringify({ chunk: tokenContent })}\n\n`);
                 }
-              } catch (jsonErr) {
-                // Skip incomplete JSON chunks
+              } catch {
+                // Ignore incomplete SSE fragments; the next chunk completes them.
               }
             }
           }
@@ -460,11 +580,10 @@ router.post('/guest/messages', async (req, res) => {
 
     } catch (llamaErr) {
       console.error('Guest chat — llama-server error:', llamaErr);
-      const errorMsg = '\n\n**Backend Connection Error:** Failed to communicate with llama-server. Ensure it is running on port 8080.';
+      const errorMsg = `\n\n**Backend Connection Error:** Failed to communicate with the selected model server (${selectedModel.id}). Check its API endpoint in server/routes/chat.js.`;
       res.write(`data: ${JSON.stringify({ chunk: errorMsg })}\n\n`);
     }
 
-    // No DB writes — stream is purely ephemeral
     res.write('data: [DONE]\n\n');
     res.end();
 

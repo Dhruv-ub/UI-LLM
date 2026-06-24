@@ -5,6 +5,21 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import chatbotIcon from "../assets/llm.png";
 import { API_BASE } from '../config';
 
+// Customize the two model names and welcome messages independently here.
+// The private model API endpoints are configured in server/routes/chat.js.
+const AVAILABLE_MODELS = {
+ flash: {
+ id: 'flash',
+ name: 'HWP-1 Flash',
+ welcome: 'Hello! Welcome to **HWP_AI Flash**. I am your professional AI assistant.'
+ },
+ pro: {
+ id: 'pro',
+ name: 'HWP-1 Pro',
+ welcome: 'Hello! Welcome to **HWP_AI Pro**. I am your professional AI assistant.'
+ }
+};
+
 export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick, onRefreshToken }) {
  // Initialize state based on window size if possible, default to true for SSR safety
  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -14,6 +29,10 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  const [inputValue, setInputValue] = useState('');
  const [isGenerating, setIsGenerating] = useState(false);
  const [showCredits, setShowCredits] = useState(false);
+ const [selectedModelId, setSelectedModelId] = useState('flash');
+ const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+ const modelMenuRef = useRef(null);
+ const selectedModel = AVAILABLE_MODELS[selectedModelId];
 
  // Guest session state — ephemeral, lost on refresh (like ChatGPT/Gemini when not logged in)
  const [guestConversations, setGuestConversations] = useState([]);
@@ -147,14 +166,14 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  {
  message_id: 'welcome-1',
  role: 'assistant',
- content: `Hello! Welcome to **HWP_AI**. I am your professional AI assistant.\n\nThis dashboard is a fully interactive React user interface connected to a Node.js + Express backend.\n\n${user
+ content: `${selectedModel.welcome}\n\nThis dashboard is a fully interactive React user interface connected to a Node.js + Express backend.\n\n${user
  ? `**You are logged in as \`${user.username}\`**! All conversations you start in the sidebar will be preserved in your database.`
  : `**You are currently browsing anonymously**. Your chat history will be kept for this session only — it will be cleared when you refresh the page. Sign in to save conversations permanently.`
  }\n\nHow can I help you build today?`
  }
  ]);
  }
- }, [activeConvId, user, isGuest, fetchMessages, isGenerating]);
+ }, [activeConvId, user, isGuest, fetchMessages, isGenerating, selectedModel]);
 
   const scrollToBottom = useCallback((behavior = 'smooth') => {
     const container = chatContainerRef.current;
@@ -269,12 +288,15 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  if (uploadMenuRef.current && !uploadMenuRef.current.contains(event.target)) {
  setIsUploadMenuOpen(false);
  }
+ if (modelMenuRef.current && !modelMenuRef.current.contains(event.target)) {
+ setIsModelMenuOpen(false);
+ }
  };
- if (isUploadMenuOpen) {
+ if (isUploadMenuOpen || isModelMenuOpen) {
  document.addEventListener('mousedown', handleClickOutside);
  }
  return () => document.removeEventListener('mousedown', handleClickOutside);
- }, [isUploadMenuOpen]);
+ }, [isUploadMenuOpen, isModelMenuOpen]);
 
  // Close credits modal on Escape key
  useEffect(() => {
@@ -412,7 +434,8 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  headers: { 'Content-Type': 'application/json' },
  body: JSON.stringify({
  messages: sessionHistory,
- content: promptToSend
+ content: promptToSend,
+ model: selectedModelId
  }),
  signal: controller.signal
  });
@@ -537,7 +560,8 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  headers: { 'Content-Type': 'application/json' },
  body: JSON.stringify({
  conversation_id: currentConvId || 'anonymous-thread',
- content: promptToSend
+ content: promptToSend,
+ model: selectedModelId
  }),
  signal: controller.signal
  });
@@ -775,12 +799,49 @@ export default function CodeView({ user, accessToken, onAuthClick, onLogoutClick
  >
  <span className="material-symbols-outlined text-[24px]">menu</span>
  </button>
- <div className="flex items-center gap-1 md:gap-xs bg-surface-container-high rounded-full px-2 py-1 md:px-sm md:py-xs border border-outline-variant/20 cursor-pointer hover:bg-surface-container-highest transition-colors min-w-0">
+ <div ref={modelMenuRef} className="relative min-w-0">
+ <button
+ type="button"
+ onClick={() => setIsModelMenuOpen((open) => !open)}
+ className="flex items-center gap-1 md:gap-xs bg-surface-container-high rounded-full px-2 py-1 md:px-sm md:py-xs border border-outline-variant/20 cursor-pointer hover:bg-surface-container-highest transition-colors min-w-0"
+ aria-haspopup="listbox"
+ aria-expanded={isModelMenuOpen}
+ >
  <span className="material-symbols-outlined text-primary text-[16px] md:text-[18px]" style={{ fontVariationSettings: "'FILL' 1" }}>
  auto_awesome
  </span>
- <span className="font-label-sm text-[12px] md:text-label-sm text-on-surface whitespace-nowrap hidden sm:inline-block">HWP-1 Flash</span>
+ <span className="font-label-sm text-[12px] md:text-label-sm text-on-surface whitespace-nowrap hidden sm:inline-block">{selectedModel.name}</span>
  <span className="material-symbols-outlined text-on-surface-variant text-[14px] md:text-[16px]">expand_more</span>
+ </button>
+ {isModelMenuOpen && (
+ <div
+ role="listbox"
+ className="absolute left-0 top-full mt-2 w-48 overflow-hidden rounded-xl border border-outline-variant/20 bg-surface-container-highest p-1.5 shadow-2xl z-50"
+ >
+ {Object.values(AVAILABLE_MODELS).map((model) => (
+ <button
+ key={model.id}
+ type="button"
+ role="option"
+ aria-selected={selectedModelId === model.id}
+ onClick={() => {
+ setSelectedModelId(model.id);
+ setIsModelMenuOpen(false);
+ }}
+ className={`w-full flex items-center justify-between rounded-lg px-3 py-2 text-left font-label-sm text-sm transition-colors ${
+ selectedModelId === model.id
+ ? 'bg-primary-container text-primary'
+ : 'text-on-surface hover:bg-surface-container-high'
+ }`}
+ >
+ <span>{model.name}</span>
+ {selectedModelId === model.id && (
+ <span className="material-symbols-outlined text-[17px]">check</span>
+ )}
+ </button>
+ ))}
+ </div>
+ )}
  </div>
  </div>
 
